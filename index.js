@@ -147,6 +147,17 @@ function normalizaTelefone(n) {
   return d;
 }
 
+// Resolve o JID REAL do numero no WhatsApp (trata o "9o digito" brasileiro e
+// confirma que o numero existe). Sem isso, mandar direto pra 55...@s.whatsapp.net
+// pode "enviar" (retorna id) mas nao entregar.
+async function resolverJid(phone) {
+  try {
+    const res = await sock.onWhatsApp(phone);
+    if (res && res[0] && res[0].exists) return res[0].jid;
+  } catch (e) { dbg('onWhatsApp erro: ' + e.message); }
+  return null;
+}
+
 const app = express();
 app.use(express.json({ limit: '25mb' }));
 
@@ -162,6 +173,17 @@ app.get('/debug', (req, res) => res.json({
   startCount, lastStep, lastConn, hasQR: !!currentQR, lastError,
   env: { SB_URL: !!SB_URL, SB_KEY: !!SB_KEY, TOKEN: !!TOKEN },
 }));
+
+// Diagnostico: verifica se um numero esta no WhatsApp e qual JID ele resolve.
+app.get('/check', async (req, res) => {
+  try {
+    if (!connected || !sock) return res.json({ ok: false, error: 'desconectado' });
+    const phone = normalizaTelefone(req.query.phone);
+    if (!phone) return res.json({ ok: false, error: 'telefone invalido' });
+    const r = await sock.onWhatsApp(phone);
+    res.json({ ok: true, phone, existe: !!(r && r[0] && r[0].exists), jid: r && r[0] ? r[0].jid : null, raw: r });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
 
 app.get('/qr', async (req, res) => {
   if (connected) return res.json({ ok: true, connected: true, qr: null, numero });
@@ -196,8 +218,10 @@ app.post('/send-text', auth, async (req, res) => {
     const phone = normalizaTelefone(req.body.phone);
     const message = req.body.message || '';
     if (!phone) return res.status(400).json({ ok: false, error: 'telefone invalido' });
-    const r = await sock.sendMessage(`${phone}@s.whatsapp.net`, { text: message });
-    res.json({ ok: true, id: r && r.key ? r.key.id : null });
+    const jid = await resolverJid(phone);
+    if (!jid) return res.status(404).json({ ok: false, error: 'numero nao esta no WhatsApp', phone });
+    const r = await sock.sendMessage(jid, { text: message });
+    res.json({ ok: true, id: r && r.key ? r.key.id : null, jid });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -209,10 +233,12 @@ app.post('/send-image', auth, async (req, res) => {
     const caption = req.body.caption || '';
     if (!phone) return res.status(400).json({ ok: false, error: 'telefone invalido' });
     if (!img) return res.status(400).json({ ok: false, error: 'imagem ausente' });
+    const jid = await resolverJid(phone);
+    if (!jid) return res.status(404).json({ ok: false, error: 'numero nao esta no WhatsApp', phone });
     img = img.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(img, 'base64');
-    const r = await sock.sendMessage(`${phone}@s.whatsapp.net`, { image: buffer, caption });
-    res.json({ ok: true, id: r && r.key ? r.key.id : null });
+    const r = await sock.sendMessage(jid, { image: buffer, caption });
+    res.json({ ok: true, id: r && r.key ? r.key.id : null, jid });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
