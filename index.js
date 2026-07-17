@@ -22,6 +22,13 @@ let connected = false;
 let numero = null;
 let iniciando = false;
 
+// --- diagnostico (visivel em /debug) ---
+let startCount = 0;
+let lastError = null;
+let lastStep = 'boot';
+let lastConn = null;
+const dbg = (s) => { lastStep = s; console.log('[wpp]', s); };
+
 async function gravarStatus() {
   if (!SB_URL || !SB_KEY) return;
   try {
@@ -43,36 +50,52 @@ async function gravarStatus() {
 async function start() {
   if (iniciando) return;
   iniciando = true;
+  startCount++;
   try {
+    dbg('carregando auth state (supabase)');
     const { state, saveCreds } = await useSupabaseAuthState(SB_URL, SB_KEY, SESSION);
-    const { version } = await fetchLatestBaileysVersion();
+
+    dbg('buscando versao do baileys');
+    let version;
+    try {
+      const r = await Promise.race([
+        fetchLatestBaileysVersion(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout versao')), 8000)),
+      ]);
+      version = r.version;
+      dbg('versao ' + JSON.stringify(version));
+    } catch (e) {
+      dbg('fetchLatestBaileysVersion falhou (' + e.message + '), usando default');
+      version = undefined;
+    }
+
+    dbg('criando socket');
     sock = makeWASocket({
-      version, auth: state, logger, printQRInTerminal: false,
-      browser: ['Octano', 'Chrome', '1.0'], syncFullHistory: false,
+      version, auth: state, logger, browser: ['Octano', 'Chrome', '1.0'], syncFullHistory: false,
     });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async (u) => {
       const { connection, lastDisconnect, qr } = u;
+      const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
+        ? lastDisconnect.error.output.statusCode : null;
+      lastConn = { connection: connection || null, code, hasQr: !!qr, at: new Date().toISOString() };
+      dbg('connection.update: ' + JSON.stringify({ connection, code, qr: !!qr }));
       if (qr) { currentQR = qr; connected = false; await gravarStatus(); }
       if (connection === 'open') {
         connected = true; currentQR = null;
         numero = (sock.user && sock.user.id ? String(sock.user.id).split(':')[0].split('@')[0] : null);
-        console.log('WhatsApp conectado:', numero);
         await gravarStatus();
       }
       if (connection === 'close') {
         connected = false;
-        const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
-          ? lastDisconnect.error.output.statusCode : null;
         await gravarStatus();
-        console.log('conexao fechada, code=', code);
         iniciando = false;
-        if (code !== DisconnectReason.loggedOut) setTimeout(start, 3000); // reconecta
-        else console.log('deslogado — precisa novo QR');
+        if (code !== DisconnectReason.loggedOut) setTimeout(start, 3000);
       }
     });
   } catch (e) {
-    console.error('erro ao iniciar:', e.message);
+    lastError = (e && e.stack) ? e.stack.slice(0, 600) : String(e);
+    dbg('ERRO start: ' + (e && e.message));
     iniciando = false;
     setTimeout(start, 5000);
   }
@@ -96,6 +119,11 @@ function auth(req, res, next) {
 
 app.get('/', (req, res) => res.json({ ok: true, service: 'octano-wpp', connected, numero }));
 app.get('/status', (req, res) => res.json({ ok: true, connected, numero, session: SESSION }));
+app.get('/debug', (req, res) => res.json({
+  ok: true, connected, numero, session: SESSION,
+  startCount, lastStep, lastConn, hasQR: !!currentQR, lastError,
+  env: { SB_URL: !!SB_URL, SB_KEY: !!SB_KEY, TOKEN: !!TOKEN },
+}));
 
 app.get('/qr', async (req, res) => {
   if (connected) return res.json({ ok: true, connected: true, qr: null, numero });
