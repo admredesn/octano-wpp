@@ -90,7 +90,8 @@ async function start() {
         connected = false;
         await gravarStatus();
         iniciando = false;
-        if (code !== DisconnectReason.loggedOut) setTimeout(start, 3000);
+        if (code === DisconnectReason.loggedOut) { await resetar(); } // deslogado -> limpa e gera QR novo
+        else setTimeout(start, 3000);
       }
     });
   } catch (e) {
@@ -100,6 +101,43 @@ async function start() {
     setTimeout(start, 5000);
   }
 }
+
+async function limparSessao() {
+  if (!SB_URL || !SB_KEY) return;
+  try {
+    await fetch(`${SB_URL.replace(/\/$/, '')}/rest/v1/oct_wpp_sessao?session_id=eq.${encodeURIComponent(SESSION)}`,
+      { method: 'DELETE', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, Prefer: 'return=minimal' } });
+  } catch (e) { /* best-effort */ }
+}
+
+// Desconecta (logout), apaga a sessao salva e reinicia -> gera QR novo (trocar de numero)
+async function resetar() {
+  dbg('reset: logout + limpa sessao + novo QR');
+  connected = false; currentQR = null; numero = null;
+  try { if (sock) await sock.logout(); } catch (e) { /* pode ja estar deslogado */ }
+  await limparSessao();
+  await gravarStatus();
+  sock = null; iniciando = false;
+  setTimeout(start, 1500);
+}
+
+// Comando via Supabase: retaguarda grava oct_wpp_status.comando='logout' (botao Desconectar).
+// Poll defensivo — se a coluna 'comando' nao existir ainda, so ignora.
+setInterval(async () => {
+  if (!SB_URL || !SB_KEY) return;
+  const b = SB_URL.replace(/\/$/, '');
+  try {
+    const r = await fetch(`${b}/rest/v1/oct_wpp_status?session_id=eq.${encodeURIComponent(SESSION)}&select=comando`,
+      { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } });
+    if (!r.ok) return;
+    const arr = await r.json();
+    if (arr && arr[0] && arr[0].comando === 'logout') {
+      await fetch(`${b}/rest/v1/oct_wpp_status?session_id=eq.${encodeURIComponent(SESSION)}`,
+        { method: 'PATCH', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify({ comando: null }) });
+      await resetar();
+    }
+  } catch (e) { /* ignora */ }
+}, 8000);
 
 function normalizaTelefone(n) {
   let d = String(n || '').replace(/\D/g, '').replace(/^0+/, '');
@@ -145,6 +183,11 @@ app.get('/scan', async (req, res) => {
      img{width:300px;height:300px;background:#fff;padding:12px;border-radius:10px;margin:12px auto;display:block}
      h2{color:#f97316}</style></head><body><h2>Conectar WhatsApp da rede</h2>${corpo}
      <p style="color:#6b7688;font-size:.8rem">A p&aacute;gina atualiza a cada 6s.</p></body></html>`);
+});
+
+app.post('/reset', auth, async (req, res) => {
+  resetar();
+  res.json({ ok: true, msg: 'desconectando e gerando QR novo' });
 });
 
 app.post('/send-text', auth, async (req, res) => {
