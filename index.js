@@ -131,6 +131,22 @@ app.get('/qr', async (req, res) => {
   res.json({ ok: true, connected: false, qr: await QRCode.toDataURL(currentQR) });
 });
 
+// Pagina HTML para escanear o QR (atualiza sozinha; o QR do WhatsApp expira ~30s)
+app.get('/scan', async (req, res) => {
+  let corpo;
+  if (connected) corpo = `<p style="color:#4ade80;font-size:1.4rem">&#10004; Conectado! N&uacute;mero: ${numero || ''}</p>`;
+  else if (currentQR) corpo = `<p>No celular do n&uacute;mero da rede: WhatsApp &rarr; Aparelhos conectados &rarr; Conectar um aparelho &rarr; escaneie:</p>
+    <img src="${await QRCode.toDataURL(currentQR)}" alt="QR">`;
+  else corpo = `<p>Gerando QR... aguarde alguns segundos (a p&aacute;gina atualiza sozinha).</p>`;
+  res.set('Content-Type', 'text/html').send(
+    `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Conectar WhatsApp - Octano</title>
+     <meta http-equiv="refresh" content="6"><meta name="viewport" content="width=device-width,initial-scale=1">
+     <style>body{font-family:system-ui,sans-serif;text-align:center;background:#0b0d14;color:#e5e7eb;padding:30px}
+     img{width:300px;height:300px;background:#fff;padding:12px;border-radius:10px;margin:12px auto;display:block}
+     h2{color:#f97316}</style></head><body><h2>Conectar WhatsApp da rede</h2>${corpo}
+     <p style="color:#6b7688;font-size:.8rem">A p&aacute;gina atualiza a cada 6s.</p></body></html>`);
+});
+
 app.post('/send-text', auth, async (req, res) => {
   try {
     if (!connected || !sock) return res.status(503).json({ ok: false, error: 'whatsapp desconectado' });
