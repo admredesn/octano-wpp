@@ -1,6 +1,6 @@
 // ============================================================
 // octano-wpp — Gateway WhatsApp da rede Octano (Baileys)
-// API REST: /status, /qr, /send-text, /send-image  (envio protegido por token)
+// API REST: /status, /qr, /send-text, /send-image, /send-document  (envio protegido por token)
 // Sessao persistida no Supabase (authState.js) + status/QR em oct_wpp_status.
 // ============================================================
 import express from 'express';
@@ -238,6 +238,25 @@ app.post('/send-image', auth, async (req, res) => {
     img = img.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(img, 'base64');
     const r = await sock.sendMessage(jid, { image: buffer, caption });
+    res.json({ ok: true, id: r && r.key ? r.key.id : null, jid });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+app.post('/send-document', auth, async (req, res) => {
+  try {
+    if (!connected || !sock) return res.status(503).json({ ok: false, error: 'whatsapp desconectado' });
+    const phone = normalizaTelefone(req.body.phone);
+    const b64 = String(req.body.document || '').replace(/^data:[^;]+;base64,/, '');
+    const fileName = req.body.fileName || 'documento.pdf';
+    const mimetype = req.body.mimetype || 'application/pdf';
+    const caption = req.body.caption || '';
+    if (!phone) return res.status(400).json({ ok: false, error: 'telefone invalido' });
+    if (!b64) return res.status(400).json({ ok: false, error: 'documento ausente' });
+    const jid = await resolverJid(phone);
+    if (!jid) return res.status(404).json({ ok: false, error: 'numero nao esta no WhatsApp', phone });
+    const r = await sock.sendMessage(jid, {
+      document: Buffer.from(b64, 'base64'), mimetype, fileName, caption,
+    });
     res.json({ ok: true, id: r && r.key ? r.key.id : null, jid });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
