@@ -6,7 +6,7 @@
 import express from 'express';
 import pino from 'pino';
 import QRCode from 'qrcode';
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import { useSupabaseAuthState } from './authState.js';
 
 const SB_URL = process.env.SUPABASE_URL || '';
@@ -27,7 +27,26 @@ let startCount = 0;
 let lastError = null;
 let lastStep = 'boot';
 let lastConn = null;
+let tentativas = 0;          // reconexoes seguidas sem conseguir abrir
+let encerrando = false;      // SIGTERM do Railway (deploy): nao reconectar, a instancia nova assume
 const dbg = (s) => { lastStep = s; console.log('[wpp]', s); };
+
+// --- mensagens enviadas (11/10/2026) ---
+// Quando o aparelho de quem recebe nao consegue decifrar, o WhatsApp pede ao remetente para
+// REENVIAR (retry). O Baileys so atende se souber a mensagem original (getMessage). Sem isso
+// a mensagem fica para sempre em "Aguardando mensagem" no aparelho de quem recebe — foi o que
+// aconteceu com todas as mensagens do sistema a partir de 09/10/2026, depois de uma tempestade
+// de reconexoes (16.346 starts) que deixou as chaves das conversas fora de sincronia.
+const enviadas = new Map();  // id da mensagem -> conteudo (proto), as ultimas 500
+const MAX_ENVIADAS = 500;
+function guardarEnviada(r) {
+  try {
+    const id = r && r.key && r.key.id;
+    if (!id || !r.message) return;
+    enviadas.set(id, r.message);
+    while (enviadas.size > MAX_ENVIADAS) enviadas.delete(enviadas.keys().next().value);
+  } catch (e) { /* diagnostico apenas */ }
+}
 
 async function gravarStatus() {
   if (!SB_URL || !SB_KEY) return;
@@ -71,7 +90,13 @@ async function start() {
 
     dbg('criando socket');
     sock = makeWASocket({
-      version, auth: state, logger, browser: ['Octano', 'Chrome', '1.0'], syncFullHistory: false,
+      version,
+      // chaves em cache na memoria: o Baileys le a MESMA chave varias vezes por mensagem e cada
+      // leitura era uma ida ao Supabase (lento e sujeito a ler um estado ja trocado)
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+      logger, browser: ['Octano', 'Chrome', '1.0'], syncFullHistory: false,
+      markOnlineOnConnect: false,           // o celular do numero continua recebendo as notificacoes
+      getMessage: async (key) => enviadas.get(key && key.id) || undefined,   // reenvio quando o aparelho pede
     });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async (u) => {
@@ -82,7 +107,7 @@ async function start() {
       dbg('connection.update: ' + JSON.stringify({ connection, code, qr: !!qr }));
       if (qr) { currentQR = qr; connected = false; await gravarStatus(); }
       if (connection === 'open') {
-        connected = true; currentQR = null;
+        connected = true; currentQR = null; tentativas = 0;
         numero = (sock.user && sock.user.id ? String(sock.user.id).split(':')[0].split('@')[0] : null);
         await gravarStatus();
       }
@@ -90,17 +115,34 @@ async function start() {
         connected = false;
         await gravarStatus();
         iniciando = false;
-        if (code === DisconnectReason.loggedOut) { await resetar(); } // deslogado -> limpa e gera QR novo
-        else setTimeout(start, 3000);
+        if (encerrando) return;                                              // deploy: a instancia nova assume
+        if (code === DisconnectReason.loggedOut) { await resetar(); return; } // deslogado -> limpa e gera QR novo
+        tentativas++;
+        // Reconexao com espera crescente (3 s, 6, 12... ate 60 s) em vez de 3 s fixos: sem isso uma
+        // queda de rede virava milhares de reconexoes seguidas. Codigo 440 = OUTRA instancia abriu a
+        // mesma sessao (deploy em andamento): espera 30 s para nao ficar derrubando uma a outra.
+        const espera = code === DisconnectReason.connectionReplaced ? 30000
+          : Math.min(60000, 3000 * Math.pow(2, Math.min(tentativas - 1, 5)));
+        dbg(`reconectando em ${espera} ms (tentativa ${tentativas}, codigo ${code})`);
+        setTimeout(start, espera);
       }
     });
   } catch (e) {
     lastError = (e && e.stack) ? e.stack.slice(0, 600) : String(e);
     dbg('ERRO start: ' + (e && e.message));
     iniciando = false;
-    setTimeout(start, 5000);
+    if (!encerrando) setTimeout(start, 5000);
   }
 }
+
+// Railway manda SIGTERM antes de trocar a instancia no deploy: fecha o socket de proposito
+// (sem reconectar) para a instancia nova nao disputar a sessao com esta.
+process.on('SIGTERM', () => {
+  encerrando = true;
+  dbg('SIGTERM: encerrando o socket sem reconectar');
+  try { if (sock) sock.end(undefined); } catch (e) { /* ja fechado */ }
+  setTimeout(() => process.exit(0), 1500);
+});
 
 async function limparSessao() {
   if (!SB_URL || !SB_KEY) return;
@@ -170,7 +212,8 @@ app.get('/', (req, res) => res.json({ ok: true, service: 'octano-wpp', connected
 app.get('/status', (req, res) => res.json({ ok: true, connected, numero, session: SESSION }));
 app.get('/debug', (req, res) => res.json({
   ok: true, connected, numero, session: SESSION,
-  startCount, lastStep, lastConn, hasQR: !!currentQR, lastError,
+  startCount, tentativas, encerrando, enviadasGuardadas: enviadas.size,
+  lastStep, lastConn, hasQR: !!currentQR, lastError,
   env: { SB_URL: !!SB_URL, SB_KEY: !!SB_KEY, TOKEN: !!TOKEN },
 }));
 
@@ -221,6 +264,7 @@ app.post('/send-text', auth, async (req, res) => {
     const jid = await resolverJid(phone);
     if (!jid) return res.status(404).json({ ok: false, error: 'numero nao esta no WhatsApp', phone });
     const r = await sock.sendMessage(jid, { text: message });
+    guardarEnviada(r);
     res.json({ ok: true, id: r && r.key ? r.key.id : null, jid });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -238,6 +282,7 @@ app.post('/send-image', auth, async (req, res) => {
     img = img.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(img, 'base64');
     const r = await sock.sendMessage(jid, { image: buffer, caption });
+    guardarEnviada(r);
     res.json({ ok: true, id: r && r.key ? r.key.id : null, jid });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -257,6 +302,7 @@ app.post('/send-document', auth, async (req, res) => {
     const r = await sock.sendMessage(jid, {
       document: Buffer.from(b64, 'base64'), mimetype, fileName, caption,
     });
+    guardarEnviada(r);
     res.json({ ok: true, id: r && r.key ? r.key.id : null, jid });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
