@@ -8,6 +8,10 @@ import pino from 'pino';
 import QRCode from 'qrcode';
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import { useSupabaseAuthState } from './authState.js';
+import { createRequire } from 'module';
+
+// versao do Baileys que o build instalou (aparece no /debug)
+const BAILEYS = (() => { try { return createRequire(import.meta.url)('@whiskeysockets/baileys/package.json').version; } catch (e) { return '?'; } })();
 
 const SB_URL = process.env.SUPABASE_URL || '';
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -15,7 +19,8 @@ const TOKEN = (process.env.WPP_TOKEN || '').trim();
 const SESSION = process.env.WPP_SESSION || 'rede';
 const PORT = process.env.PORT || 3000;
 
-const logger = pino({ level: 'silent' });
+// 'warn' (antes 'silent'): falha de gravar chave / de decifrar aparece no log do Railway
+const logger = pino({ level: 'warn' });
 let sock = null;
 let currentQR = null;
 let connected = false;
@@ -29,6 +34,23 @@ let lastStep = 'boot';
 let lastConn = null;
 let tentativas = 0;          // reconexoes seguidas sem conseguir abrir
 let encerrando = false;      // SIGTERM do Railway (deploy): nao reconectar, a instancia nova assume
+let falhasBanco = 0;         // leituras/gravacoes de chave que falharam mesmo com retentativa (20/10/2026)
+let ultimaFalhaBanco = null;
+
+// AUTH STATE UMA VEZ SO' (20/10/2026): antes cada reconexao (a cada ~50 min o WhatsApp derruba com codigo 500)
+// relia tudo do Supabase e jogava fora o cache das chaves -- se uma gravacao ainda estava a caminho, a conversa
+// voltava com a chave velha. Agora o estado e o cache vivem o processo inteiro; so' o resetar() (logout) recria.
+let estadoAuth = null;
+let chaves = null;
+async function authState() {
+  if (!estadoAuth) {
+    estadoAuth = await useSupabaseAuthState(SB_URL, SB_KEY, SESSION, (m) => {
+      falhasBanco++; ultimaFalhaBanco = { msg: m, at: new Date().toISOString() }; console.log('[wpp]', m);
+    });
+    chaves = makeCacheableSignalKeyStore(estadoAuth.state.keys, logger);
+  }
+  return estadoAuth;
+}
 const dbg = (s) => { lastStep = s; console.log('[wpp]', s); };
 
 // --- mensagens enviadas (11/10/2026) ---
@@ -72,7 +94,7 @@ async function start() {
   startCount++;
   try {
     dbg('carregando auth state (supabase)');
-    const { state, saveCreds } = await useSupabaseAuthState(SB_URL, SB_KEY, SESSION);
+    const { state, saveCreds } = await authState();
 
     dbg('buscando versao do baileys');
     let version;
@@ -93,7 +115,7 @@ async function start() {
       version,
       // chaves em cache na memoria: o Baileys le a MESMA chave varias vezes por mensagem e cada
       // leitura era uma ida ao Supabase (lento e sujeito a ler um estado ja trocado)
-      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+      auth: { creds: state.creds, keys: chaves },
       logger, browser: ['Octano', 'Chrome', '1.0'], syncFullHistory: false,
       markOnlineOnConnect: false,           // o celular do numero continua recebendo as notificacoes
       getMessage: async (key) => enviadas.get(key && key.id) || undefined,   // reenvio quando o aparelho pede
@@ -160,6 +182,7 @@ async function resetar() {
   await limparSessao();
   await gravarStatus();
   sock = null; iniciando = false;
+  estadoAuth = null; chaves = null;    // sessao apagada: a proxima partida le do zero
   setTimeout(start, 1500);
 }
 
@@ -212,7 +235,7 @@ app.get('/', (req, res) => res.json({ ok: true, service: 'octano-wpp', connected
 app.get('/status', (req, res) => res.json({ ok: true, connected, numero, session: SESSION }));
 app.get('/debug', (req, res) => res.json({
   ok: true, connected, numero, session: SESSION,
-  startCount, tentativas, encerrando, enviadasGuardadas: enviadas.size,
+  baileys: BAILEYS, startCount, tentativas, encerrando, enviadasGuardadas: enviadas.size, falhasBanco, ultimaFalhaBanco,
   lastStep, lastConn, hasQR: !!currentQR, lastError,
   env: { SB_URL: !!SB_URL, SB_KEY: !!SB_KEY, TOKEN: !!TOKEN },
 }));
